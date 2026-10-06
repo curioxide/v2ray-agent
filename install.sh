@@ -9578,7 +9578,6 @@ proxy-providers:
       enable: true
       url: https://cp.cloudflare.com/generate_204
       interval: 180
-      lazy: false
 
 proxy-groups:
   - name: 手动切换
@@ -9599,7 +9598,6 @@ proxy-groups:
     type: fallback
     url: https://cp.cloudflare.com/generate_204
     interval: 300
-    lazy: false
     use:
       - ${subscribeSalt}_provider
     proxies:
@@ -9607,10 +9605,7 @@ proxy-groups:
       - 自动选择
 
   - name: 全球代理
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
@@ -9618,20 +9613,14 @@ proxy-groups:
       - DIRECT
 
   - name: 流媒体
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - 故障转移
       - DIRECT
   - name: DNS_Proxy
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
@@ -9640,48 +9629,33 @@ proxy-groups:
       - DIRECT
 
   - name: Telegram
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - 故障转移
   - name: Google
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - 故障转移
       - DIRECT
   - name: YouTube
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - 故障转移
   - name: Netflix
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - 流媒体
       - 故障转移
   - name: Spotify
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
@@ -9689,20 +9663,14 @@ proxy-groups:
       - 故障转移
       - DIRECT
   - name: HBO
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - 流媒体
       - 故障转移
   - name: Bing
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
@@ -9710,40 +9678,28 @@ proxy-groups:
 
 
   - name: OpenAI
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - 故障转移
 
   - name: ClaudeAI
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - 故障转移
 
   - name: Disney
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - 流媒体
       - 故障转移
   - name: GitHub
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
@@ -9751,29 +9707,20 @@ proxy-groups:
       - DIRECT
 
   - name: 国内媒体
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - DIRECT
   - name: 本地直连
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
       - DIRECT
       - 故障转移
   - name: 漏网之鱼
-    type: fallback
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: false
+    type: select
     use:
       - ${subscribeSalt}_provider
     proxies:
