@@ -192,6 +192,11 @@ initVar() {
 
     subscribeType=
 
+    # 订阅使用的域名，与协议域名解绑
+    subscribeDomain=
+    # 订阅域名配置文件
+    subscribeDomainPath=/etc/v2ray-agent/subscribe_local/subscribeDomain
+
     # sing-box reality serverName publicKey
     singBoxVLESSRealityGRPCServerName=
     singBoxVLESSRealityVisionServerName=
@@ -506,23 +511,117 @@ readCustomPort() {
     fi
 }
 
+# 读取订阅nginx配置中的域名
+readSubscribeConfigDomain() {
+    if [[ -f "${nginxConfigPath}subscribe.conf" ]]; then
+        local nginxSubscribeDomain=
+        nginxSubscribeDomain=$(grep "server_name" "${nginxConfigPath}subscribe.conf" | awk '{print $2}' | sed 's/;//g')
+        # 存在多个server_name时只取第一个
+        nginxSubscribeDomain=${nginxSubscribeDomain%%,*}
+        echo "${nginxSubscribeDomain}"
+    fi
+}
+
+# 读取订阅域名[与协议域名解绑]
+readSubscribeDomain() {
+    subscribeDomain=
+    local recordSubscribeDomain=
+    recordSubscribeDomain=$(cat "${subscribeDomainPath}" 2>/dev/null | head -1 | sed 's/[[:space:]]//g')
+    # 已设置的订阅域名以记录为准
+    if [[ -n "${recordSubscribeDomain}" ]]; then
+        subscribeDomain="${recordSubscribeDomain}"
+    elif [[ -f "${nginxConfigPath}subscribe.conf" ]]; then
+        # 兼容旧版本，未记录订阅域名时读取订阅nginx配置
+        subscribeDomain=$(readSubscribeConfigDomain)
+    fi
+    if [[ -z "${subscribeDomain}" ]]; then
+        # 兼容旧版本，默认使用协议域名
+        if [[ -n "${currentHost}" ]]; then
+            subscribeDomain="${currentHost}"
+        elif [[ -n "${domain}" ]]; then
+            subscribeDomain="${domain}"
+        fi
+    fi
+    if [[ -z "${subscribeDomain}" ]]; then
+        echoContent red " ---> 未检测到订阅域名，请先完成协议安装"
+        exit 0
+    fi
+    if [[ "${recordSubscribeDomain}" != "${subscribeDomain}" ]]; then
+        writeSubscribeDomain
+    fi
+}
+
+# 保存订阅域名
+writeSubscribeDomain() {
+    if [[ -n "${subscribeDomain}" ]]; then
+        mkdir -p "$(dirname "${subscribeDomainPath}")"
+        echo "${subscribeDomain}" >"${subscribeDomainPath}"
+    fi
+}
+
+# 修改订阅域名[与协议域名解绑]
+manageSubscribeDomain() {
+    if [[ -z "${configPath}" ]]; then
+        echoContent red " ---> 未安装，请使用脚本安装"
+        exit 0
+    fi
+    echoContent skyBlue "\n功能 1/${totalProgress} : 订阅域名管理"
+    readNginxSubscribe
+    readSubscribeDomain
+    local currentSubscribeDomain=${subscribeDomain}
+    local currentPort=${subscribePort}
+    echoContent red "\n=============================================================="
+    echoContent yellow "# 订阅域名与协议域名相互独立，不修改协议使用的域名"
+    echoContent yellow "# 修改订阅域名时会自动为订阅域名申请、安装TLS证书"
+    echoContent yellow "# 订阅域名需提前解析到当前服务器IP"
+    echoContent green "当前订阅域名: ${currentSubscribeDomain:-未设置}"
+    if [[ -n "${currentPort}" ]]; then
+        echoContent green "当前订阅端口: ${currentPort}"
+    fi
+    echoContent red "=============================================================="
+    while read -r -p "请输入新的订阅域名[回车取消]:" newSubscribeDomain; do
+        if [[ -z "${newSubscribeDomain}" ]]; then
+            echoContent yellow " ---> 已取消"
+            return 0
+        fi
+        if [[ "${newSubscribeDomain}" == "${currentSubscribeDomain}" ]]; then
+            echoContent yellow " ---> 订阅域名未发生变化"
+            return 0
+        fi
+        if echo "${newSubscribeDomain}" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$' && ! echo "${newSubscribeDomain}" | grep -q "\.\."; then
+            break
+        fi
+        echoContent red " ---> 订阅域名格式错误，例:sub.v2ray-agent.com"
+    done
+    domain="${newSubscribeDomain}"
+    subscribeDomain="${newSubscribeDomain}"
+    installSubscribeTLS
+    writeSubscribeDomain
+    # 使用已有的订阅端口重新生成订阅nginx配置，立即生效
+    installSubscribe
+    echoContent green "\n ---> 订阅域名修改成功:${subscribeDomain}"
+    readNginxSubscribe
+    if [[ -n "${subscribePort}" ]]; then
+        read -r -p "是否立即重新生成订阅链接[y/n]:" updateSubscribeStatus
+        if [[ "${updateSubscribeStatus}" == "y" ]]; then
+            subscribe false false
+            return 0
+        fi
+    fi
+    manageAccount 1
+}
+
 # 读取nginx订阅端口
 readNginxSubscribe() {
     subscribeType="https"
     if [[ -f "${nginxConfigPath}subscribe.conf" ]]; then
         if grep -q "sing-box" "${nginxConfigPath}subscribe.conf"; then
             subscribePort=$(grep "listen" "${nginxConfigPath}subscribe.conf" | awk '{print $2}')
-            subscribeDomain=$(grep "server_name" "${nginxConfigPath}subscribe.conf" | awk '{print $2}')
-            subscribeDomain=${subscribeDomain//;/}
-            if [[ -n "${currentHost}" && "${subscribeDomain}" != "${currentHost}" ]]; then
-                subscribePort=
-                subscribeType=
-            else
-                if ! grep "listen" "${nginxConfigPath}subscribe.conf" | grep -q "ssl"; then
-                    subscribeType="http"
-                fi
+            # 订阅域名与协议域名解绑，此处不再校验协议域名
+            subscribeDomain=$(readSubscribeConfigDomain)
+            if ! grep "listen" "${nginxConfigPath}subscribe.conf" | grep -q "ssl"; then
+                subscribeType="http"
             fi
-
         fi
     fi
 }
@@ -2208,6 +2307,63 @@ installTLS() {
         echoContent yellow " ---> 未安装acme.sh"
         exit 0
     fi
+}
+
+# 为订阅域名申请、安装TLS证书[复用已有TLS逻辑]
+installSubscribeTLS() {
+    if [[ -z "${subscribeDomain}" ]]; then
+        echoContent red " ---> 订阅域名为空，无法申请证书"
+        exit 0
+    fi
+    # installTLS、acmeInstallSSL均使用domain
+    domain="${subscribeDomain}"
+
+    handleNginx stop
+    if [[ -f "/etc/v2ray-agent/tls/${subscribeDomain}.crt" && -f "/etc/v2ray-agent/tls/${subscribeDomain}.key" && -n $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.crt") ]]; then
+        echoContent green " ---> 检测到订阅域名证书"
+        handleNginx start
+        return 0
+    fi
+
+    echoContent skyBlue "\n ---> 开始为订阅域名[${subscribeDomain}]申请TLS证书"
+    # readAcmeTLS会根据domain设置dnsTLSDomain
+    readAcmeTLS
+    switchDNSAPI
+    if [[ -z "${dnsAPIType}" ]]; then
+        echoContent yellow " ---> 不采用API申请证书"
+        echoContent green " ---> 安装TLS证书，需要依赖80端口"
+        allowPort 80
+    fi
+    switchSSLType
+    customSSLEmail
+    selectAcmeInstallSSL
+
+    echoContent skyBlue " ---> 开始安装订阅域名证书"
+    sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${subscribeDomain}" --fullchainpath "/etc/v2ray-agent/tls/${subscribeDomain}.crt" --keypath "/etc/v2ray-agent/tls/${subscribeDomain}.key" --ecc 2>&1 | tee -a /etc/v2ray-agent/tls/acme.log >/dev/null
+
+    if [[ ! -f "/etc/v2ray-agent/tls/${subscribeDomain}.crt" || ! -f "/etc/v2ray-agent/tls/${subscribeDomain}.key" ]] || [[ -z $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.key") || -z $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.crt") ]]; then
+        tail -n 10 /etc/v2ray-agent/tls/acme.log
+        echoContent red " ---> 订阅域名TLS安装失败，请检查acme日志"
+        echo
+        read -r -p "是否重新申请？[y/n]:" reInstallSubscribeTLSStatus
+        if [[ "${reInstallSubscribeTLSStatus}" == "y" ]]; then
+            if tail -n 10 /etc/v2ray-agent/tls/acme.log | grep -q "Could not validate email address as valid"; then
+                customSSLEmail "validate email"
+            fi
+            # 清理失败记录后重新申请
+            if [[ -d "$HOME/.acme.sh/${subscribeDomain}_ecc" ]]; then
+                sudo "$HOME/.acme.sh/acme.sh" --remove -d "${subscribeDomain}" --ecc >/dev/null 2>&1
+            fi
+            rm -f "/etc/v2ray-agent/tls/${subscribeDomain}.crt" "/etc/v2ray-agent/tls/${subscribeDomain}.key"
+            installSubscribeTLS
+            return $?
+        fi
+        handleNginx start
+        exit 0
+    fi
+
+    echoContent green " ---> 订阅域名TLS证书生成成功"
+    handleNginx start
 }
 
 # 初始化随机字符串
@@ -9042,6 +9198,7 @@ manageAccount() {
     echoContent yellow "3.管理其他订阅"
     echoContent yellow "4.添加用户"
     echoContent yellow "5.删除用户"
+    echoContent yellow "6.订阅域名管理"
     echoContent red "=============================================================="
     read -r -p "请输入:" manageAccountStatus
     if [[ "${manageAccountStatus}" == "1" ]]; then
@@ -9054,6 +9211,8 @@ manageAccount() {
         addUser
     elif [[ "${manageAccountStatus}" == "5" ]]; then
         removeUser
+    elif [[ "${manageAccountStatus}" == "6" ]]; then
+        manageSubscribeDomain
     else
         echoContent red " ---> 选择错误"
     fi
@@ -9062,6 +9221,7 @@ manageAccount() {
 # 安装订阅
 installSubscribe() {
     readNginxSubscribe
+    readSubscribeDomain
     local nginxSubscribeListen=
     local nginxSubscribeSSL=
     local serverName=
@@ -9084,6 +9244,7 @@ installSubscribe() {
         echoContent yellow "开始配置订阅，请输入订阅的端口\n"
 
         mapfile -t result < <(initSingBoxPort "${subscribePort}")
+        subscribePort=${result[-1]}
         echo
         echoContent yellow " ---> 开始配置订阅的伪装站点\n"
         nginxBlog
@@ -9105,16 +9266,12 @@ installSubscribe() {
                 exit
             fi
         else
-            local subscribeServerName=
-            if [[ -n "${currentHost}" ]]; then
-                subscribeServerName="${currentHost}"
-            else
-                subscribeServerName="${domain}"
-            fi
+            # 订阅域名与协议域名解绑，独立申请、使用订阅域名证书
+            installSubscribeTLS
 
             SSLType="ssl"
-            serverName="server_name ${subscribeServerName};"
-            nginxSubscribeSSL="ssl_certificate /etc/v2ray-agent/tls/${subscribeServerName}.crt;ssl_certificate_key /etc/v2ray-agent/tls/${subscribeServerName}.key;"
+            serverName="server_name ${subscribeDomain};"
+            nginxSubscribeSSL="ssl_certificate /etc/v2ray-agent/tls/${subscribeDomain}.crt;ssl_certificate_key /etc/v2ray-agent/tls/${subscribeDomain}.key;"
         fi
         if [[ -n "$(curl --connect-timeout 2 -s -6 http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | cut -d "=" -f 2)" ]]; then
             listenIPv6="listen [::]:${result[-1]} ${SSLType};"
@@ -9676,16 +9833,16 @@ subscribe() {
                 base64Result=$(base64 -w 0 "/etc/v2ray-agent/subscribe/default/${emailMd5}")
                 echo "${base64Result}" >"/etc/v2ray-agent/subscribe/default/${emailMd5}"
                 echoContent yellow "--------------------------------------------------------------"
-                local currentDomain=${currentHost}
+                local currentDomain=${subscribeDomain}
 
                 if [[ -n "${currentDefaultPort}" && "${currentDefaultPort}" != "443" ]]; then
-                    currentDomain="${currentHost}:${currentDefaultPort}"
+                    currentDomain="${subscribeDomain}:${currentDefaultPort}"
                 fi
                 if [[ -n "${subscribePortLocal}" ]]; then
                     if [[ "${subscribeType}" == "http" ]]; then
                         currentDomain="$(getPublicIP):${subscribePort}"
                     else
-                        currentDomain="${currentHost}:${subscribePort}"
+                        currentDomain="${subscribeDomain}:${subscribePort}"
                     fi
                 fi
                 if [[ -z "${showStatus}" ]]; then
