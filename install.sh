@@ -573,7 +573,7 @@ manageSubscribeDomain() {
     echoContent red "\n=============================================================="
     echoContent yellow "# 订阅域名与协议域名相互独立，不修改协议使用的域名"
     echoContent yellow "# 修改订阅域名时会自动为订阅域名申请、安装TLS证书"
-    echoContent yellow "# 订阅域名需提前解析到当前服务器IP"
+    echoContent yellow "# 使用HTTP-01申请证书时需先将订阅域名解析到本机IP，使用DNS API无此要求"
     echoContent green "当前订阅域名: ${currentSubscribeDomain:-未设置}"
     if [[ -n "${currentPort}" ]]; then
         echoContent green "当前订阅端口: ${currentPort}"
@@ -2309,7 +2309,34 @@ installTLS() {
     fi
 }
 
-# 为订阅域名申请、安装TLS证书[复用已有TLS逻辑]
+# 查询acme.sh中可用的证书名[acme.sh以证书名而非域名查找证书，通配符证书的名字形如*.example.com]
+getSubscribeCertName() {
+    local domainName=$1
+    local candidate certConfig certName certDomain
+    for candidate in "${domainName}" "*.${domainName#*.}"; do
+        for certConfig in "$HOME/.acme.sh/${candidate}_ecc/${candidate}.conf" "$HOME/.acme.sh/${candidate}/${candidate}.conf"; do
+            [[ -f "${certConfig}" ]] || continue
+            certDomain=$(sed -n "s/^Le_Domain=['\"]*\([^'\"]*\)['\"]*.*/\1/p" "${certConfig}" | head -1)
+            [[ "${certDomain}" == "${candidate}" ]] || continue
+            certName="${certDomain}"
+            if [[ -f "$HOME/.acme.sh/${certName}_ecc/${certName}.cer" ]] || [[ -f "$HOME/.acme.sh/${certName}/${certName}.cer" ]]; then
+                echo "${certName}"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# 将acme.sh中的证书安装到订阅域名路径[使用真实证书名，兼容通配符证书]
+installSubscribeCert() {
+    local certName=$1
+    [[ -z "${certName}" ]] && certName="${subscribeDomain}"
+    echoContent skyBlue " ---> 使用acme.sh证书[${certName}]安装订阅域名证书"
+    sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${certName}" --fullchainpath "/etc/v2ray-agent/tls/${subscribeDomain}.crt" --keypath "/etc/v2ray-agent/tls/${subscribeDomain}.key" --ecc 2>&1 | tee -a /etc/v2ray-agent/tls/acme.log >/dev/null
+}
+
+# 为订阅域名申请、安装TLS证书[复用已有TLS逻辑，兼容通配符与自定义证书]
 installSubscribeTLS() {
     if [[ -z "${subscribeDomain}" ]]; then
         echoContent red " ---> 订阅域名为空，无法申请证书"
@@ -2317,47 +2344,75 @@ installSubscribeTLS() {
     fi
     # installTLS、acmeInstallSSL均使用domain
     domain="${subscribeDomain}"
+    local certName=
+    local reInstallSubscribeTLSStatus=
 
     handleNginx stop
     if [[ -f "/etc/v2ray-agent/tls/${subscribeDomain}.crt" && -f "/etc/v2ray-agent/tls/${subscribeDomain}.key" && -n $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.crt") ]]; then
-        echoContent green " ---> 检测到订阅域名证书"
+        echoContent green " ---> 检测到订阅域名证书[已存在或自定义证书]，直接使用"
         handleNginx start
         return 0
     fi
 
-    echoContent skyBlue "\n ---> 开始为订阅域名[${subscribeDomain}]申请TLS证书"
-    # readAcmeTLS会根据domain设置dnsTLSDomain
-    readAcmeTLS
-    switchDNSAPI
-    if [[ -z "${dnsAPIType}" ]]; then
-        echoContent yellow " ---> 不采用API申请证书"
-        echoContent green " ---> 安装TLS证书，需要依赖80端口"
-        allowPort 80
+    # acme.sh中已有可用证书[含覆盖该域名的通配符证书]时直接安装，不再重复申请
+    if certName=$(getSubscribeCertName "${subscribeDomain}") && [[ -n "${certName}" ]]; then
+        echoContent green " ---> acme.sh中检测到可用证书[${certName}]，直接安装"
+        handleNginx start
+        installSubscribeCert "${certName}"
+    else
+        echoContent skyBlue "\n ---> 开始为订阅域名[${subscribeDomain}]申请TLS证书"
+        # readAcmeTLS会根据domain设置dnsTLSDomain
+        readAcmeTLS
+        switchDNSAPI
+        if [[ -z "${dnsAPIType}" ]]; then
+            echoContent yellow " ---> 不采用API申请证书"
+            echoContent green " ---> 安装TLS证书，需要依赖80端口"
+            allowPort 80
+        fi
+        switchSSLType
+        customSSLEmail
+        selectAcmeInstallSSL
+
+        certName=$(getSubscribeCertName "${subscribeDomain}")
+        if [[ -z "${certName}" ]]; then
+            certName="${subscribeDomain}"
+        fi
+        echoContent skyBlue " ---> 开始安装订阅域名证书"
+        installSubscribeCert "${certName}"
     fi
-    switchSSLType
-    customSSLEmail
-    selectAcmeInstallSSL
 
-    echoContent skyBlue " ---> 开始安装订阅域名证书"
-    sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${subscribeDomain}" --fullchainpath "/etc/v2ray-agent/tls/${subscribeDomain}.crt" --keypath "/etc/v2ray-agent/tls/${subscribeDomain}.key" --ecc 2>&1 | tee -a /etc/v2ray-agent/tls/acme.log >/dev/null
-
-    if [[ ! -f "/etc/v2ray-agent/tls/${subscribeDomain}.crt" || ! -f "/etc/v2ray-agent/tls/${subscribeDomain}.key" ]] || [[ -z $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.key") || -z $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.crt") ]]; then
+    local tlsInstallStatus=
+    while [[ ! -f "/etc/v2ray-agent/tls/${subscribeDomain}.crt" || ! -f "/etc/v2ray-agent/tls/${subscribeDomain}.key" ]] || [[ -z $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.key" 2>/dev/null) || -z $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.crt" 2>/dev/null) ]]; do
         tail -n 10 /etc/v2ray-agent/tls/acme.log
         echoContent red " ---> 订阅域名TLS安装失败，请检查acme日志"
         echo
+        [[ -n "${tlsInstallStatus}" ]] && break
         read -r -p "是否重新申请？[y/n]:" reInstallSubscribeTLSStatus
-        if [[ "${reInstallSubscribeTLSStatus}" == "y" ]]; then
-            if tail -n 10 /etc/v2ray-agent/tls/acme.log | grep -q "Could not validate email address as valid"; then
-                customSSLEmail "validate email"
-            fi
-            # 清理失败记录后重新申请
-            if [[ -d "$HOME/.acme.sh/${subscribeDomain}_ecc" ]]; then
-                sudo "$HOME/.acme.sh/acme.sh" --remove -d "${subscribeDomain}" --ecc >/dev/null 2>&1
-            fi
-            rm -f "/etc/v2ray-agent/tls/${subscribeDomain}.crt" "/etc/v2ray-agent/tls/${subscribeDomain}.key"
-            installSubscribeTLS
-            return $?
+        [[ "${reInstallSubscribeTLSStatus}" != "y" ]] && break
+        tlsInstallStatus=true
+        if tail -n 10 /etc/v2ray-agent/tls/acme.log | grep -q "Could not validate email address as valid"; then
+            customSSLEmail "validate email"
         fi
+        # 清理同名失败记录后重新申请[通配符证书保留，避免影响协议域名]
+        if [[ -d "$HOME/.acme.sh/${subscribeDomain}_ecc" ]]; then
+            sudo "$HOME/.acme.sh/acme.sh" --remove -d "${subscribeDomain}" --ecc >/dev/null 2>&1
+        fi
+        rm -f "/etc/v2ray-agent/tls/${subscribeDomain}.crt" "/etc/v2ray-agent/tls/${subscribeDomain}.key"
+        if [[ "${dnsAPIStatus}" == "y" && -n "${dnsTLSDomain}" ]]; then
+            echoContent skyBlue " ---> 重新申请通配符证书[*.${dnsTLSDomain}]"
+            acmeInstallSSL
+            certName=$(getSubscribeCertName "${subscribeDomain}")
+            [[ -z "${certName}" ]] && certName="*.${dnsTLSDomain}"
+        else
+            echoContent skyBlue " ---> 重新申请证书[${subscribeDomain}]"
+            selectAcmeInstallSSL
+            certName=$(getSubscribeCertName "${subscribeDomain}")
+            [[ -z "${certName}" ]] && certName="${subscribeDomain}"
+        fi
+        installSubscribeCert "${certName}"
+    done
+
+    if [[ ! -f "/etc/v2ray-agent/tls/${subscribeDomain}.crt" || ! -f "/etc/v2ray-agent/tls/${subscribeDomain}.key" ]] || [[ -z $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.key" 2>/dev/null) || -z $(cat "/etc/v2ray-agent/tls/${subscribeDomain}.crt" 2>/dev/null) ]]; then
         handleNginx start
         exit 0
     fi
