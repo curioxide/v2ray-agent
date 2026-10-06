@@ -9318,14 +9318,71 @@ manageAccount() {
 }
 
 # 安装订阅
-installSubscribe() {
+# 生成订阅nginx配置[订阅域名、证书、端口均由已有状态推导，可重复执行]
+generateSubscribeNginxConfig() {
     readNginxSubscribe
     readSubscribeDomain
+    if [[ -z "${subscribePort}" ]]; then
+        echoContent red " ---> 未检测到订阅端口，无法生成订阅配置"
+        return 1
+    fi
+
     local nginxSubscribeListen=
     local nginxSubscribeSSL=
     local serverName=
     local SSLType=
     local listenIPv6=
+    local sslCertificatePath="/etc/v2ray-agent/tls/${subscribeDomain}.crt"
+    local sslCertificateKeyPath="/etc/v2ray-agent/tls/${subscribeDomain}.key"
+    local nginxVersion=
+    nginxVersion=$(nginx -v 2>&1)
+
+    # 无证书时[例如http订阅]不启用ssl
+    if [[ -f "${sslCertificatePath}" && -f "${sslCertificateKeyPath}" ]]; then
+        SSLType="ssl"
+        nginxSubscribeSSL="ssl_certificate ${sslCertificatePath};ssl_certificate_key ${sslCertificateKeyPath};"
+    else
+        echoContent yellow " ---> 未检测到订阅域名证书[${sslCertificatePath}]，订阅将使用http"
+    fi
+    serverName="server_name ${subscribeDomain};"
+
+    if [[ -n "$(curl --connect-timeout 2 -s -6 http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | cut -d "=" -f 2)" ]]; then
+        listenIPv6="listen [::]:${subscribePort} ${SSLType};"
+    fi
+    # nginx 1.25.1以上使用http2 on[版本无法解析时回退到旧写法]
+    if [[ "$(echo "${nginxVersion}" | awk -F "[.]" '{print $2}')" -gt 25 ]] 2>/dev/null; then
+        nginxSubscribeListen="listen ${subscribePort} ${SSLType} so_keepalive=on;http2 on;${listenIPv6}"
+    else
+        nginxSubscribeListen="listen ${subscribePort} ${SSLType} so_keepalive=on;${listenIPv6}"
+    fi
+
+    cat <<EOF >${nginxConfigPath}subscribe.conf
+server {
+    ${nginxSubscribeListen}
+    ${serverName}
+    ${nginxSubscribeSSL}
+    ssl_protocols              TLSv1.2 TLSv1.3;
+    ssl_ciphers                TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers  on;
+
+    resolver                   1.1.1.1 valid=60s;
+    resolver_timeout           2s;
+    client_max_body_size 100m;
+    root ${nginxStaticPath};
+    location ~ ^/s/(clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles)/(.*) {
+        default_type 'text/plain; charset=utf-8';
+        alias /etc/v2ray-agent/subscribe/\$1/\$2;
+    }
+    location / {
+    }
+}
+EOF
+}
+
+# 安装订阅
+installSubscribe() {
+    readNginxSubscribe
+    readSubscribeDomain
     if [[ -z "${subscribePort}" ]]; then
 
         nginxVersion=$(nginx -v 2>&1)
@@ -9367,41 +9424,14 @@ installSubscribe() {
         else
             # 订阅域名与协议域名解绑，独立申请、使用订阅域名证书
             installSubscribeTLS
-
-            SSLType="ssl"
-            serverName="server_name ${subscribeDomain};"
-            nginxSubscribeSSL="ssl_certificate /etc/v2ray-agent/tls/${subscribeDomain}.crt;ssl_certificate_key /etc/v2ray-agent/tls/${subscribeDomain}.key;"
-        fi
-        if [[ -n "$(curl --connect-timeout 2 -s -6 http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | cut -d "=" -f 2)" ]]; then
-            listenIPv6="listen [::]:${result[-1]} ${SSLType};"
-        fi
-        if echo "${nginxVersion}" | grep -q "1.25" && [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $3}') -gt 0 ]] || [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $2}') -gt 25 ]]; then
-            nginxSubscribeListen="listen ${result[-1]} ${SSLType} so_keepalive=on;http2 on;${listenIPv6}"
-        else
-            nginxSubscribeListen="listen ${result[-1]} ${SSLType} so_keepalive=on;${listenIPv6}"
         fi
 
-        cat <<EOF >${nginxConfigPath}subscribe.conf
-server {
-    ${nginxSubscribeListen}
-    ${serverName}
-    ${nginxSubscribeSSL}
-    ssl_protocols              TLSv1.2 TLSv1.3;
-    ssl_ciphers                TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
-    ssl_prefer_server_ciphers  on;
-
-    resolver                   1.1.1.1 valid=60s;
-    resolver_timeout           2s;
-    client_max_body_size 100m;
-    root ${nginxStaticPath};
-    location ~ ^/s/(clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles)/(.*) {
-        default_type 'text/plain; charset=utf-8';
-        alias /etc/v2ray-agent/subscribe/\$1/\$2;
-    }
-    location / {
-    }
-}
-EOF
+        if ! generateSubscribeNginxConfig; then
+            if [[ -z $(pgrep -f "nginx") ]]; then
+                handleNginx start
+            fi
+            return 1
+        fi
         bootStartup nginx
         handleNginx stop
         handleNginx start
@@ -9871,8 +9901,11 @@ syncSubscribeNginxConfig() {
         return 0
     fi
     echoContent yellow " ---> 订阅nginx配置与订阅域名[${subscribeDomain}]不一致，开始重建"
-    # installSubscribe会使用已存在的订阅端口重新生成subscribe.conf
-    installSubscribe
+    # 订阅端口已存在时直接按当前订阅域名重写配置
+    if generateSubscribeNginxConfig; then
+        handleNginx stop
+        handleNginx start
+    fi
     readNginxSubscribe
     readSubscribeDomain
 }
