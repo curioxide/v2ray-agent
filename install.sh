@@ -196,6 +196,8 @@ initVar() {
     subscribeDomain=
     # 订阅域名配置文件
     subscribeDomainPath=/etc/v2ray-agent/subscribe_local/subscribeDomain
+    # 订阅nginx配置与订阅域名不一致[需要重建]
+    subscribeNginxConfigSyncStatus=
 
     # sing-box reality serverName publicKey
     singBoxVLESSRealityGRPCServerName=
@@ -522,17 +524,39 @@ readSubscribeConfigDomain() {
     fi
 }
 
+# 读取订阅nginx配置中的端口
+readSubscribeConfigPort() {
+    if [[ -f "${nginxConfigPath}subscribe.conf" ]]; then
+        grep "listen" "${nginxConfigPath}subscribe.conf" | awk '{print $2}' | sed 's/;//g' | grep -E '^[0-9]+$' | head -1
+    fi
+}
+
+# 订阅nginx配置与订阅域名不一致时以nginx配置为准[例如用户手工修改过配置]
+setSubscribeDomainFromNginx() {
+    local nginxSubscribeDomain=
+    nginxSubscribeDomain=$(readSubscribeConfigDomain)
+    if [[ -n "${nginxSubscribeDomain}" && "${nginxSubscribeDomain}" != "${subscribeDomain}" ]]; then
+        subscribeDomain="${nginxSubscribeDomain}"
+        writeSubscribeDomain
+    fi
+}
+
 # 读取订阅域名[与协议域名解绑]
 readSubscribeDomain() {
     subscribeDomain=
+    subscribeNginxConfigSyncStatus=
     local recordSubscribeDomain=
+    local nginxSubscribeDomain=
     recordSubscribeDomain=$(cat "${subscribeDomainPath}" 2>/dev/null | head -1 | sed 's/[[:space:]]//g')
+    if [[ -f "${nginxConfigPath}subscribe.conf" ]]; then
+        nginxSubscribeDomain=$(readSubscribeConfigDomain)
+    fi
     # 已设置的订阅域名以记录为准
     if [[ -n "${recordSubscribeDomain}" ]]; then
         subscribeDomain="${recordSubscribeDomain}"
-    elif [[ -f "${nginxConfigPath}subscribe.conf" ]]; then
+    elif [[ -n "${nginxSubscribeDomain}" ]]; then
         # 兼容旧版本，未记录订阅域名时读取订阅nginx配置
-        subscribeDomain=$(readSubscribeConfigDomain)
+        subscribeDomain="${nginxSubscribeDomain}"
     fi
     if [[ -z "${subscribeDomain}" ]]; then
         # 兼容旧版本，默认使用协议域名
@@ -548,6 +572,13 @@ readSubscribeDomain() {
     fi
     if [[ "${recordSubscribeDomain}" != "${subscribeDomain}" ]]; then
         writeSubscribeDomain
+    fi
+    # 订阅nginx配置与订阅域名不一致时需要重建[例如上次修改域名中途退出]
+    if [[ -f "${nginxConfigPath}subscribe.conf" && "${nginxSubscribeDomain}" != "${subscribeDomain}" ]]; then
+        subscribeNginxConfigSyncStatus=true
+    elif [[ -z "${recordSubscribeDomain}" && -n "${nginxSubscribeDomain}" ]]; then
+        # 兼容旧版本: 无订阅域名记录但有订阅配置时，以nginx中正在使用的域名为准
+        setSubscribeDomainFromNginx
     fi
 }
 
@@ -570,6 +601,7 @@ manageSubscribeDomain() {
     readSubscribeDomain
     local currentSubscribeDomain=${subscribeDomain}
     local currentPort=${subscribePort}
+    local nginxConfigSyncStatus=${subscribeNginxConfigSyncStatus}
     echoContent red "\n=============================================================="
     echoContent yellow "# 订阅域名与协议域名相互独立，不修改协议使用的域名"
     echoContent yellow "# 修改订阅域名时会自动为订阅域名申请、安装TLS证书"
@@ -578,14 +610,21 @@ manageSubscribeDomain() {
     if [[ -n "${currentPort}" ]]; then
         echoContent green "当前订阅端口: ${currentPort}"
     fi
+    if [[ "${nginxConfigSyncStatus}" == "true" ]]; then
+        echoContent red "注意: 订阅nginx配置与当前订阅域名不一致，将自动重建"
+    fi
     echoContent red "=============================================================="
     while read -r -p "请输入新的订阅域名[回车取消]:" newSubscribeDomain; do
         if [[ -z "${newSubscribeDomain}" ]]; then
             echoContent yellow " ---> 已取消"
+            # 配置不一致时[例如上次修改中断]仍然重建一次
+            syncSubscribeNginxConfig
             return 0
         fi
         if [[ "${newSubscribeDomain}" == "${currentSubscribeDomain}" ]]; then
             echoContent yellow " ---> 订阅域名未发生变化"
+            # 域名未变化也要确保nginx配置一致
+            syncSubscribeNginxConfig
             return 0
         fi
         if echo "${newSubscribeDomain}" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$' && ! echo "${newSubscribeDomain}" | grep -q "\.\."; then
@@ -615,13 +654,18 @@ manageSubscribeDomain() {
 readNginxSubscribe() {
     subscribeType="https"
     if [[ -f "${nginxConfigPath}subscribe.conf" ]]; then
-        if grep -q "sing-box" "${nginxConfigPath}subscribe.conf"; then
-            subscribePort=$(grep "listen" "${nginxConfigPath}subscribe.conf" | awk '{print $2}')
-            # 订阅域名与协议域名解绑，此处不再校验协议域名
-            subscribeDomain=$(readSubscribeConfigDomain)
-            if ! grep "listen" "${nginxConfigPath}subscribe.conf" | grep -q "ssl"; then
-                subscribeType="http"
-            fi
+        local nginxSubscribePort=
+        nginxSubscribePort=$(readSubscribeConfigPort)
+        if [[ -n "${nginxSubscribePort}" ]]; then
+            subscribePort="${nginxSubscribePort}"
+        fi
+        local nginxSubscribeDomain=
+        nginxSubscribeDomain=$(readSubscribeConfigDomain)
+        if [[ -n "${nginxSubscribeDomain}" ]]; then
+            subscribeDomain="${nginxSubscribeDomain}"
+        fi
+        if ! grep "listen" "${nginxConfigPath}subscribe.conf" | grep -q "ssl"; then
+            subscribeType="http"
         fi
     fi
 }
@@ -9821,10 +9865,23 @@ initRandomSalt() {
     done
     echo "${initCustomPath}"
 }
+# 重建与订阅域名不一致的订阅nginx配置[例如上次修改订阅域名中途退出]
+syncSubscribeNginxConfig() {
+    if [[ "${subscribeNginxConfigSyncStatus}" != "true" || ! -f "${nginxConfigPath}subscribe.conf" ]]; then
+        return 0
+    fi
+    echoContent yellow " ---> 订阅nginx配置与订阅域名[${subscribeDomain}]不一致，开始重建"
+    # installSubscribe会使用已存在的订阅端口重新生成subscribe.conf
+    installSubscribe
+    readNginxSubscribe
+    readSubscribeDomain
+}
+
 # 订阅
 subscribe() {
     readInstallProtocolType
     installSubscribe
+    syncSubscribeNginxConfig
 
     readNginxSubscribe
     local renewSalt=$1
