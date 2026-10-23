@@ -2673,7 +2673,16 @@ installCronUpdateGeo() {
 renewalTLS() {
 
     if [[ -n $1 ]]; then
-        echoContent skyBlue "\n进度  $1/1 : 更新证书"
+        echoContent skyBlue "\n进度  $1/1 : 证书管理"
+        echoContent red "\n=============================================================="
+        echoContent yellow "1.查看证书状态/续期[默认]"
+        echoContent yellow "2.重新申请证书[删除已有证书后重新申请]"
+        echoContent red "=============================================================="
+        read -r -p "请选择[回车]使用默认:" selectCertificateType
+        if [[ "${selectCertificateType}" == "2" ]]; then
+            reapplyTLS
+            return 0
+        fi
     fi
     local domain=${currentHost}
     if [[ -z "${currentHost}" && -n "${tlsDomain}" ]]; then
@@ -2779,6 +2788,72 @@ renewalTLS() {
     reloadCore
     handleNginx start
     return 0
+}
+
+# 重新申请证书[删除已有证书后复用installTLS的申请逻辑]
+reapplyTLS() {
+    # installTLS依赖全局domain变量
+    if [[ -z "${domain}" ]]; then
+        domain="${currentHost}"
+    fi
+    if [[ -z "${domain}" && -n "${tlsDomain}" ]]; then
+        domain="${tlsDomain}"
+    fi
+    if [[ -z "${domain}" ]]; then
+        echoContent red " ---> 未检测到证书域名，请先安装证书"
+        return 0
+    fi
+
+    readAcmeTLS
+    # acme.sh以证书名存储，通配符证书的名字形如*.example.com
+    local wildcardDomain=
+    if [[ "${installedDNSAPIStatus}" == "true" ]]; then
+        wildcardDomain="*.${dnsTLSDomain}"
+    fi
+
+    local certPath="/etc/v2ray-agent/tls/${domain}.crt"
+    local keyPath="/etc/v2ray-agent/tls/${domain}.key"
+    echoContent yellow "\n ---> 将删除域名[${domain}]的现有证书[含自定义证书]并重新申请"
+    read -r -p "是否继续？[y/n]:" reapplyTLSStatus
+    if [[ "${reapplyTLSStatus}" != "y" ]]; then
+        echoContent yellow " ---> 已取消"
+        return 0
+    fi
+
+    # 备份现有证书，申请失败时回滚，避免服务器失去可用证书
+    if [[ -s "${certPath}" && -s "${keyPath}" ]]; then
+        cp -f "${certPath}" "${certPath}.bak"
+        cp -f "${keyPath}" "${keyPath}.bak"
+    fi
+
+    # 释放80端口，避免acme独立验证与nginx冲突
+    handleNginx stop
+    rm -f "${certPath}" "${keyPath}"
+    rm -rf "$HOME/.acme.sh/${domain}_ecc" "$HOME/.acme.sh/${domain}"
+    if [[ -n "${wildcardDomain}" ]]; then
+        rm -rf "$HOME/.acme.sh/${wildcardDomain}_ecc" "$HOME/.acme.sh/${wildcardDomain}"
+    fi
+
+    echoContent skyBlue "\n ---> 开始重新申请证书"
+    # 子shell执行，隔离installTLS内部申请失败时的exit
+    (installTLS 1)
+
+    if [[ ! -s "${certPath}" || ! -s "${keyPath}" ]]; then
+        echoContent red " ---> 证书重新申请失败，请查看 /etc/v2ray-agent/tls/acme.log"
+        if [[ -s "${certPath}.bak" && -s "${keyPath}.bak" ]]; then
+            mv -f "${certPath}.bak" "${certPath}"
+            mv -f "${keyPath}.bak" "${keyPath}"
+            echoContent yellow " ---> 已恢复原证书[acme.sh中的签发记录已删除，定时续期将失效]"
+        fi
+        reloadCore
+        handleNginx start
+        return 1
+    fi
+
+    rm -f "${certPath}.bak" "${keyPath}.bak"
+    echoContent green " ---> 证书重新申请成功"
+    reloadCore
+    handleNginx start
 }
 
 # 安装 sing-box
